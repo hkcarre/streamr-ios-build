@@ -1,0 +1,250 @@
+name: Streamr
+options:
+  bundleIdPrefix: nyc.streamr
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+configs:
+  Debug: debug
+  Staging: release
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+# Google/Facebook sign-in. Sign in with Apple needs no SPM package (it's the
+# system AuthenticationServices framework), just the entitlement below.
+#
+# AmazonIVSBroadcast is a *local* package, not a normal remote git-URL one —
+# AWS doesn't host a git repo for it, only a versioned Package.swift manifest
+# (vendored at Vendor/AmazonIVSBroadcast/Package.swift) whose targets pull in
+# remote binary XCFrameworks. Use product AmazonIVSBroadcastStages (the
+# real-time Stages-capable variant this app needs), not the plain
+# AmazonIVSBroadcast product (classic-channel-only, and mutually exclusive
+# with the Stages variant per AWS's own docs).
+packages:
+  GoogleSignIn:
+    url: https://github.com/google/GoogleSignIn-iOS
+    from: 7.1.0
+  FacebookSDK:
+    url: https://github.com/facebook/facebook-ios-sdk
+    from: 17.0.0
+  AmazonIVSBroadcast:
+    path: Vendor/AmazonIVSBroadcast
+  # Live chat. Vendored the same way and for the same reason as
+  # AmazonIVSBroadcast — AWS ships only a versioned XCFramework, no git repo.
+  # See Vendor/AmazonIVSChatMessaging/Package.swift for how the checksum was
+  # produced without a Mac.
+  AmazonIVSChatMessaging:
+    path: Vendor/AmazonIVSChatMessaging
+  # Raw STPPaymentCardTextField + STPAPIClient (StripePaymentsUI/StripePayments),
+  # not the newer all-in-one PaymentSheet product — deliberately mirrors the
+  # website's own Stripe Elements card-entry + initial-payment/confirm-payment
+  # two-step flow (see PlansView/PlansViewModel's doc comments) rather than a
+  # different native UX, per "mimic the current backend/website" priority.
+  Stripe:
+    url: https://github.com/stripe/stripe-ios
+    # Confirmed live 2026-09-28: 26.0.0+ uses allowsNumberPadPopover, a
+    # UIKit trait that only exists on the iOS 26 SDK / Xcode 26+ — this
+    # project's CI runner (macos-15) has Xcode 16.4, which fails to compile
+    # it at all (not a runtime issue, a hard compile error inside Stripe's
+    # own source). 25.x is the last major line built against the iOS 18 SDK
+    # this runner actually has; `from:` resolves up to but not past 26.0.0.
+    from: 25.0.0
+
+targets:
+  Streamr:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Streamr
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/Streamr.entitlements"
+    configFiles:
+      Debug: Config/Debug.xcconfig
+      Staging: Config/Staging.xcconfig
+      Release: Config/Release.xcconfig
+    info:
+      path: Streamr/Resources/Info.plist
+      # IMPORTANT: `xcodegen generate` does NOT merge these properties into
+      # whatever's already at `path` — it discards the tracked file's other
+      # keys entirely and emits only what's declared here (confirmed
+      # 2026-09-01 by parsing a real CI-built .ipa's compiled Info.plist:
+      # APIBaseURL/GIDClientID/FacebookAppID/camera-mic strings were all
+      # silently absent, despite the tracked file on disk having them,
+      # because they weren't declared here). This block must stay the
+      # complete, authoritative list of every custom key the app needs —
+      # the physical Streamr/Resources/Info.plist file is not a fallback.
+      properties:
+        CFBundleDevelopmentRegion: $(DEVELOPMENT_LANGUAGE)
+        CFBundleDisplayName: Streamr
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        ITSAppUsesNonExemptEncryption: false
+        APIBaseURL: $(API_BASE_URL)
+        APIEnvironmentName: $(API_ENVIRONMENT_NAME)
+        GIDClientID: $(GOOGLE_CLIENT_ID)
+        FacebookAppID: $(FACEBOOK_APP_ID)
+        FacebookClientToken: $(FACEBOOK_CLIENT_TOKEN)
+        FacebookDisplayName: $(FACEBOOK_DISPLAY_NAME)
+        # Both default to TRUE in FBSDK 17. Left on, the SDK collects the
+        # advertising identifier and auto-logs app events, which Apple counts as
+        # tracking — that would oblige the app to show an App Tracking
+        # Transparency prompt (with NSUserTrackingUsageDescription) and to
+        # declare NSPrivacyTracking true, and shipping without either is a
+        # rejection and an App Privacy mismatch.
+        #
+        # The Facebook SDK is here only for Login. Nothing in this app needs ad
+        # attribution, so collection is switched off and the privacy manifest's
+        # NSPrivacyTracking=false stays truthful. Turning either of these back on
+        # means revisiting PrivacyInfo.xcprivacy and adding an ATT prompt.
+        FacebookAdvertiserIDCollectionEnabled: false
+        FacebookAutoLogAppEventsEnabled: false
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - $(GOOGLE_REVERSED_CLIENT_ID)
+          - CFBundleURLSchemes:
+              - fb$(FACEBOOK_APP_ID)
+        LSApplicationQueriesSchemes:
+          - fbapi
+          - fbauth2
+          - fbshareextension
+        NSCameraUsageDescription: Streamr needs camera access so you can go live or record a video episode.
+        NSMicrophoneUsageDescription: Streamr needs microphone access so you can go live or record an episode.
+        # Required for Picture in Picture and for audio-only episodes to keep
+        # playing once the app is backgrounded. Without it the system suspends
+        # the player the moment you leave the screen, so "offer user
+        # PIP/navigation in phone while video continues to play" (2026-10-11)
+        # cannot work no matter how AVPlayerViewController is configured —
+        # see VideoPlayerContainer.
+        UIBackgroundModes:
+          - audio
+        # Heebo, the Style Guide's brand typeface. One variable font file covers
+        # every weight (Thin..Black on the wght axis) — see Typography.swift.
+        # Without this key the file ships in the bundle but is never registered,
+        # and Font.custom silently falls back to the system font.
+        UIAppFonts:
+          - Heebo-Variable.ttf
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Belt and braces alongside TARGETED_DEVICE_FAMILY: "1" above. With
+        # the device family corrected this should be moot, since iPad rules
+        # no longer apply — but App Store Connect rejected a build over
+        # exactly this key, and an iPad-only variant costs nothing and
+        # changes no iPhone behaviour (iPhone keeps portrait-only from the
+        # key above). Cheaper than another round trip through upload
+        # validation to find out.
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIUserInterfaceStyle: Dark
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nyc.streamr.streamr
+        PRODUCT_NAME: Streamr
+        ENABLE_PREVIEWS: YES
+        CODE_SIGN_ENTITLEMENTS: Streamr/Resources/Streamr.entitlements
+        # Must be set HERE, on the target, not only in the project-wide
+        # `settings.base` above — confirmed 2026-10-06 by parsing a real
+        # CI-built .ipa's compiled Info.plist, which had
+        # `UIDeviceFamily: [1, 2]` (iPhone AND iPad) despite the
+        # project-level setting saying "1". XcodeGen emits its own
+        # application-target default that wins over the project-level value.
+        #
+        # This wasn't cosmetic: shipping as a universal app made App Store
+        # Connect apply iPad rules at upload validation and reject the build
+        # ("you need to include all of the ... orientations to support iPad
+        # multitasking"), even though this is a portrait iPhone app.
+        TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        # Release is what the TestFlight workflow archives, and it uses
+        # fully MANUAL signing against a certificate and profile created
+        # ahead of time through the App Store Connect API.
+        #
+        # Automatic signing was tried three times and failed three times,
+        # each run costing real macOS runner minutes:
+        #   1. No identity set -> Xcode asked the portal for a *development*
+        #      profile, which is device-specific, and died on a team with no
+        #      registered devices ("Your team has no devices from which to
+        #      generate a provisioning profile").
+        #   2. CODE_SIGN_IDENTITY passed on the xcodebuild command line ->
+        #      "conflicting provisioning settings", and because a CLI setting
+        #      applies to EVERY target, the Stripe/Facebook/GoogleSignIn SPM
+        #      resource bundles (which need no identity at all) each failed
+        #      the same way.
+        #   3. Same setting moved here into project.yml -> identical
+        #      conflict. Xcode treats an explicit CODE_SIGN_IDENTITY as
+        #      "manually specified" wherever it is defined, while still
+        #      resolving automatic signing to *development*. Proven by the
+        #      portal containing exactly one cert, type DEVELOPMENT, created
+        #      at the minute run 1 executed.
+        #
+        # So: stop fighting the heuristic and state the intent outright. The
+        # cert and profile are generated via the ASC API (free, verifiable
+        # from Windows, no runner minutes) and the workflow imports them into
+        # a throwaway keychain. These settings are scoped to this target
+        # only, so SPM dependency targets keep the project-wide Automatic
+        # default and are signed by Xcode at embed time as usual.
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          PROVISIONING_PROFILE_SPECIFIER: Streamr App Store CI
+          DEVELOPMENT_TEAM: K6SA6TAMJQ
+    dependencies:
+      - package: GoogleSignIn
+        product: GoogleSignIn
+      - package: GoogleSignIn
+        product: GoogleSignInSwift
+      - package: FacebookSDK
+        product: FacebookCore
+      - package: FacebookSDK
+        product: FacebookLogin
+      - package: AmazonIVSBroadcast
+        product: AmazonIVSBroadcastStages
+      - package: AmazonIVSChatMessaging
+        product: AmazonIVSChatMessaging
+      - package: Stripe
+        product: StripePayments
+      - package: Stripe
+        product: StripePaymentsUI
+    scheme:
+      testTargets:
+        - StreamrTests
+        - StreamrUITests
+      gatherCoverageData: false
+
+  StreamrTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: StreamrTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nyc.streamr.streamr.tests
+    dependencies:
+      - target: Streamr
+
+  StreamrUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: StreamrUITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nyc.streamr.streamr.uitests
+    dependencies:
+      - target: Streamr

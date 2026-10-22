@@ -1,0 +1,148 @@
+name: iOS CI
+
+# Fast "does it build, and give me something sideloadable" job. The expensive
+# half of what this file used to do — simulator build + UI tests + screenshot
+# export — now lives in ios-ui-tests.yml, triggered manually.
+#
+# Why the split (2026-10-06): macOS runners bill at $0.08/min and 10x against
+# the account's included minutes, and this workflow was compiling the whole app
+# TWICE per run (once for the simulator so the UI tests could run, once for
+# iphoneos so there'd be an IPA) on top of a ~6 minute test suite — ~16 min a
+# run. Most pushes only need the answer to "does it compile and can I sideload
+# it", which is the device build alone. The test suite still exists and still
+# produces screenshots; it just isn't billed on every single push any more.
+on:
+  # Manual trigger so an IPA can be produced on demand without needing a
+  # throwaway commit — and, on a minute-constrained account, so pushes can be
+  # made without automatically spending a build on them.
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '**.pdf'
+      - 'docs/**'
+      - 'wireframes/**'
+  # No pull_request trigger, deliberately (2026-10-21). This workflow is
+  # mirrored into a PUBLIC repository so the build can use the free macOS
+  # runners public repos get. On a public repo anyone may open a pull request,
+  # and a pull_request trigger would let a stranger run their own code on a
+  # runner. GitHub withholds repository secrets from fork pull requests, so
+  # this was never a secret-disclosure route, but arbitrary code execution on
+  # a runner is an abuse vector worth closing outright. Nobody opens pull
+  # requests against either repo anyway - work lands by pushing to main.
+
+# Five runs fired inside 13 minutes on 2026-10-06, all of which ran to
+# completion (~75 macOS minutes, ~$6) when only the last one's result was ever
+# looked at. A newer push to the same branch makes an older in-flight run
+# irrelevant, so cancel it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # CI never sees Config/Secrets.xcconfig — it's gitignored and only
+      # ever existed on the dev's own Windows machine. Every IPA built
+      # before this step existed shipped with Debug/Release/Staging
+      # .xcconfig's REPLACE_ME placeholders baked in, not the real
+      # credentials, even after they'd been "added" locally — this is the
+      # actual source of real values in anything that leaves this runner.
+      # Writes the same gitignored file format a local dev would use (see
+      # Config/Secrets.xcconfig.example), sourced from encrypted repo
+      # secrets instead. Safe even for a secret that isn't set yet — that
+      # just produces an empty value, which Debug/Release/Staging
+      # .xcconfig's `#include?` tolerates the same as the file not existing
+      # (REPLACE_ME defaults stay in place, app still builds, that
+      # provider's login just stays non-functional).
+      - name: Write real OAuth credentials from GitHub Secrets
+        env:
+          FACEBOOK_CLIENT_TOKEN: ${{ secrets.FACEBOOK_CLIENT_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_REVERSED_CLIENT_ID: ${{ secrets.GOOGLE_REVERSED_CLIENT_ID }}
+        run: |
+          cat > Config/Secrets.xcconfig << EOF
+          FACEBOOK_CLIENT_TOKEN = ${FACEBOOK_CLIENT_TOKEN}
+          GOOGLE_CLIENT_ID = ${GOOGLE_CLIENT_ID}
+          GOOGLE_REVERSED_CLIENT_ID = ${GOOGLE_REVERSED_CLIENT_ID}
+          EOF
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # Resolving Stripe + Facebook + GoogleSignIn + the IVS binary
+      # XCFrameworks from scratch is a couple of minutes of the run on its
+      # own. Keyed on project.yml because that's the only file that changes
+      # which packages/versions get pulled; anything else changing can
+      # safely reuse the same checkouts.
+      - name: Cache SwiftPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: DerivedData/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # Cheap sanity check (a couple of seconds) kept from the old workflow:
+      # XcodeGen silently dropped the asset catalog from the Resources build
+      # phase once before, which is invisible until the app runs with no
+      # icons or images. Not worth a separate job.
+      - name: Check asset catalog is wired into the project
+        run: |
+          grep -q "Assets.xcassets" Streamr.xcodeproj/project.pbxproj \
+            && echo "Assets.xcassets: referenced" \
+            || echo "WARNING: Assets.xcassets not referenced in project.pbxproj"
+
+      # Unsigned real-device build, for free-Apple-ID sideloading (Sideloadly/
+      # AltStore) on Windows — no Apple Developer Program membership needed.
+      # CODE_SIGNING_ALLOWED=NO produces a plain unsigned .app; Sideloadly does
+      # its own signing pass locally using a free Apple ID, so nothing here
+      # needs real certificates or provisioning profiles.
+      #
+      # This is now the ONLY compile in this job — the old simulator build was
+      # redundant with the one the UI test job does for itself.
+      - name: Build unsigned app (real device)
+        run: |
+          xcodebuild build \
+            -project Streamr.xcodeproj \
+            -scheme Streamr \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Confirmed live 2026-09-28: an artifact-storage-quota failure on an
+      # unrelated upload step silently skipped packaging, because the default
+      # `if: success()` treats ANY earlier failure as reason to skip. Kept as
+      # `always()` so a run still produces a usable IPA when something
+      # incidental fails.
+      - name: Package unsigned .ipa
+        if: always()
+        run: |
+          APP_PATH="DerivedData/Build/Products/Debug-iphoneos/Streamr.app"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r Streamr-unsigned.ipa Payload
+
+      # retention-days matters as much as minutes do: artifact storage has its
+      # own 500 MB free allowance, and on 2026-10-06 this repo was sitting at
+      # 673 MB live across 100 artifacts — over the limit, which is what caused
+      # the "Artifact storage quota has been hit" failures back in September.
+      # The IPA is only ~12 MB each, but GitHub's 90-day default kept every one
+      # of them. A week is plenty for something you either sideload the same
+      # day or rebuild.
+      - name: Upload unsigned IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamr-unsigned-ipa
+          path: Streamr-unsigned.ipa
+          if-no-files-found: warn
+          retention-days: 7

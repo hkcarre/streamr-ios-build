@@ -1,0 +1,126 @@
+name: iOS UI Tests & Screenshots
+
+# The expensive half of what ios-ci.yml used to do, split out 2026-10-06 so it
+# stops billing on every push. Simulator build + full UI test suite + the
+# screenshot export is ~10 of the ~16 minutes a combined run took, and macOS
+# runners bill at $0.08/min (10x against included minutes) — but the answer it
+# produces ("do the flows still work, and what do the screens look like now")
+# is only actually wanted occasionally, not on every commit.
+#
+# Run it from the Actions tab -> this workflow -> "Run workflow", or on the
+# weekly schedule below. The screenshots land in the `app-screenshots`
+# artifact on the run.
+on:
+  workflow_dispatch: {}
+  # One scheduled run a week so a regression can't sit undetected for long
+  # between manual runs. ~16 min/week is a rounding error next to what
+  # per-push runs cost.
+  schedule:
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # See ios-ci.yml's copy of this step for why it exists — CI never sees
+      # the gitignored local Config/Secrets.xcconfig, so real credential
+      # values come from encrypted repo secrets or not at all.
+      - name: Write real OAuth credentials from GitHub Secrets
+        env:
+          FACEBOOK_CLIENT_TOKEN: ${{ secrets.FACEBOOK_CLIENT_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_REVERSED_CLIENT_ID: ${{ secrets.GOOGLE_REVERSED_CLIENT_ID }}
+        run: |
+          cat > Config/Secrets.xcconfig << EOF
+          FACEBOOK_CLIENT_TOKEN = ${FACEBOOK_CLIENT_TOKEN}
+          GOOGLE_CLIENT_ID = ${GOOGLE_CLIENT_ID}
+          GOOGLE_REVERSED_CLIENT_ID = ${GOOGLE_REVERSED_CLIENT_ID}
+          EOF
+
+      - name: Xcode & simulator info
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Cache SwiftPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: DerivedData/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # Builds for the simulator as a side effect, so there's no separate
+      # build step — the old workflow's standalone simulator build was pure
+      # duplicated work.
+      - name: Run UI tests and capture screenshots
+        run: |
+          xcodebuild test \
+            -project Streamr.xcodeproj \
+            -scheme Streamr \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -derivedDataPath DerivedData \
+            -resultBundlePath TestResults \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Diagnose compiled asset catalog
+        if: always()
+        run: |
+          echo "--- All Streamr.app bundles found under DerivedData ---"
+          find DerivedData -name "Streamr.app" 2>/dev/null | while read -r APP_PATH; do
+            echo "App path: $APP_PATH"
+            if [ -f "$APP_PATH/Assets.car" ]; then
+              echo "  Assets.car: FOUND"
+              xcrun --sdk iphonesimulator assetutil --info "$APP_PATH/Assets.car" 2>/dev/null | grep '"Name"' | sed 's/^/    /'
+            else
+              echo "  Assets.car: NOT FOUND"
+              echo "  Bundle contents:"
+              find "$APP_PATH" -maxdepth 1 | sed 's/^/    /'
+            fi
+          done
+
+      - name: Export screenshots from test results
+        if: always()
+        run: |
+          mkdir -p Screenshots
+          xcrun xcresulttool export attachments \
+            --path TestResults.xcresult \
+            --output-path Screenshots \
+            || xcrun xcresulttool get --legacy --format json --path TestResults.xcresult > TestResults.json || true
+          ls -la Screenshots || true
+
+      # Measured 2026-10-06: screenshots ~32 MB a run, the xcresult bundle up
+      # to ~95 MB — between them they were 360 of the 673 MB of live artifacts
+      # that pushed this repo past the 500 MB free storage allowance. The
+      # xcresult is purely a fallback for when screenshot export fails, so it
+      # gets the shortest retention of anything here.
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-screenshots
+          path: Screenshots
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload raw test result bundle (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresult-bundle
+          path: TestResults.xcresult
+          if-no-files-found: ignore
+          retention-days: 3

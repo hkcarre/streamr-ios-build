@@ -1,0 +1,247 @@
+name: TestFlight (signed)
+
+# Manual trigger only, deliberately — unlike ios-ci.yml's unsigned build
+# (harmless to run on every push), a real run here uploads an actual build
+# to App Store Connect: uses a build slot, bumps the build number, and is
+# visible to everyone with TestFlight access. Not something to fire on
+# every commit.
+on:
+  workflow_dispatch: {}
+
+# Deliberately `cancel-in-progress: false`, unlike ios-ci.yml's. Killing a
+# build mid-upload can leave a half-delivered build in App Store Connect and
+# burns the run_number-derived build number either way; a queued second run is
+# cheaper than an ambiguous upload state. This only serialises runs, it doesn't
+# cancel them.
+concurrency:
+  group: testflight-upload
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same mechanism as ios-ci.yml's equivalent step — see that file's
+      # comment for why this exists at all (CI never sees the gitignored
+      # local Config/Secrets.xcconfig).
+      - name: Write real OAuth credentials from GitHub Secrets
+        env:
+          FACEBOOK_CLIENT_TOKEN: ${{ secrets.FACEBOOK_CLIENT_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_REVERSED_CLIENT_ID: ${{ secrets.GOOGLE_REVERSED_CLIENT_ID }}
+        run: |
+          cat > Config/Secrets.xcconfig << EOF
+          FACEBOOK_CLIENT_TOKEN = ${FACEBOOK_CLIENT_TOKEN}
+          GOOGLE_CLIENT_ID = ${GOOGLE_CLIENT_ID}
+          GOOGLE_REVERSED_CLIENT_ID = ${GOOGLE_REVERSED_CLIENT_ID}
+          EOF
+
+      # Written to the runner's ephemeral workspace, never committed (only
+      # ever `cat >`'d, never `git add`'d) — cleaned up explicitly at the
+      # end anyway as defense in depth, even though the whole runner is
+      # destroyed after the job regardless. Still needed for the UPLOAD step
+      # even under manual signing, since that authenticates to App Store
+      # Connect rather than doing anything with certificates.
+      - name: Write Apple API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          mkdir -p private_keys
+          cat > "private_keys/AuthKey_${APPLE_API_KEY_ID}.p8" << EOF
+          ${APPLE_API_KEY_P8}
+          EOF
+
+      # Manual signing: the distribution certificate and the App Store
+      # provisioning profile were both created up front through the App Store
+      # Connect API (see project.yml's Release config comment for why
+      # automatic signing was abandoned after three failed runs). All this
+      # step does is make them available to codesign.
+      #
+      # The keychain is created fresh per run and deleted at the end. The
+      # set-key-partition-list call is the non-obvious part: without it,
+      # codesign prompts for keychain access and the build hangs or fails on
+      # a headless runner even though the identity imported fine.
+      - name: Import signing certificate and provisioning profile
+        env:
+          DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
+          DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+          DIST_PROFILE_BASE64: ${{ secrets.DIST_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 24)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          # Prepend to the search list, keeping the existing entries, so
+          # codesign can actually find the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          echo "$DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -k "$KEYCHAIN" \
+            -P "$DIST_P12_PASSWORD" -A -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
+          rm -f "$RUNNER_TEMP/dist.p12"
+
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          echo "$DIST_PROFILE_BASE64" | base64 --decode \
+            > "$PROFILE_DIR/Streamr_AppStore.mobileprovision"
+
+          echo "--- codesigning identities available ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # App Store Connect rejected an upload on 2026-10-06 with "This app was
+      # built with the iOS 18.5 SDK. All iOS and iPadOS apps must be built
+      # with the iOS 26 SDK or later" — Apple now hard-requires Xcode 26+ for
+      # ANY upload, and macos-15's default Xcode is 16.4. No new runner image
+      # needed: this image already ships Xcode 26.0.1 through 26.3 alongside
+      # the 16.x line, so it's only a matter of selecting one.
+      #
+      # Picks the highest Xcode 26 present rather than hardcoding a version,
+      # since the runner image's exact point releases change over time. Fails
+      # loudly (and lists what IS available) rather than silently falling back
+      # to 16.4 and wasting a full archive on a build Apple will reject.
+      #
+      # Deliberately NOT applied to ios-ci.yml: that workflow produces the
+      # unsigned Sideloadly IPA, it's currently green on Xcode 16.4, and it
+      # never touches App Store Connect, so there's no reason to risk the
+      # known-good fallback path on a toolchain bump.
+      - name: Select Xcode 26 (required by App Store Connect)
+        run: |
+          set -euo pipefail
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then
+            echo "No Xcode 26 found on this runner image. Available:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          echo "Selected: $XC"
+          sudo xcode-select -s "$XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Cache SwiftPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: DerivedData/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # No signing settings on this command line, on purpose: an xcodebuild
+      # CLI build setting applies to every target in the project, which is
+      # what made run 2 fail on the Stripe/Facebook/GoogleSignIn resource
+      # bundles. The manual signing settings live in project.yml scoped to
+      # the app target. No -allowProvisioningUpdates either — with manual
+      # signing there is nothing for Xcode to go and create.
+      #
+      # BUILD NUMBERS ARE ASSIGNED BY XCODE AT UPLOAD, not here.
+      #
+      # This step used to pass CURRENT_PROJECT_VERSION="${{ github.run_number }}"
+      # with a comment claiming that produced the build number. It did not, and
+      # the claim was wrong in a way worth recording: XcodeGen emits a LITERAL
+      # `CFBundleVersion` of "1", not `$(CURRENT_PROJECT_VERSION)`, so the
+      # setting had nothing to interpolate into and never reached the bundle.
+      # Verified 2026-10-11 by parsing a real CI-built .ipa's compiled
+      # Info.plist: CFBundleVersion is "1".
+      #
+      # Uploads still get unique, increasing numbers because ExportOptions.plist
+      # leaves `manageAppVersionAndBuildNumber` at its default of true, which
+      # makes Xcode rewrite the build number to one higher than anything already
+      # uploaded. That's why App Store Connect shows 1,2,3,4,5 for runs 4,5,6,7,8
+      # — sequential per successful upload, unrelated to the run number.
+      #
+      # Consequence to be aware of: a build number can't be traced back to a
+      # commit. If that traceability is wanted, declare
+      # `CFBundleVersion: $(CURRENT_PROJECT_VERSION)` in project.yml's
+      # info.properties, pass the run number here again, AND set
+      # manageAppVersionAndBuildNumber to false — all three, or Xcode overwrites
+      # it anyway. Left alone for now because the current behaviour is safe and
+      # has carried five successful uploads.
+      - name: Archive (Release, manually signed)
+        run: |
+          xcodebuild archive \
+            -project Streamr.xcodeproj \
+            -scheme Streamr \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Streamr.xcarchive \
+            -derivedDataPath DerivedData
+
+      # signingStyle manual + an explicit provisioningProfiles mapping, to
+      # match how the archive was signed. `destination: upload` is what makes
+      # -exportArchive also deliver to App Store Connect in the same step
+      # rather than needing a separate altool/Transporter call.
+      - name: Write ExportOptions.plist
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > ExportOptions.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>teamID</key>
+              <string>${APPLE_TEAM_ID}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>signingCertificate</key>
+              <string>Apple Distribution</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>nyc.streamr.streamr</key>
+                  <string>Streamr App Store CI</string>
+              </dict>
+              <key>destination</key>
+              <string>upload</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export & upload to TestFlight
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/Streamr.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions.plist \
+            -authenticationKeyPath "$(pwd)/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8" \
+            -authenticationKeyID "${APPLE_API_KEY_ID}" \
+            -authenticationKeyIssuerID "${APPLE_API_ISSUER_ID}"
+
+      # Surfaces the real reason on failure. xcodebuild's own output often
+      # only says "exportArchive failed" while the actionable detail sits in
+      # these logs.
+      - name: Dump export logs on failure
+        if: failure()
+        run: |
+          find "$HOME/Library/Logs/gym" "$HOME/Library/Developer/Xcode/DerivedData" \
+            -name "*.log" -newermt '-20 minutes' 2>/dev/null | head -5 | while read -r f; do
+            echo "=== $f ==="; tail -80 "$f"
+          done
+          ls -la build/export 2>/dev/null || true
+
+      - name: Clean up key and keychain
+        if: always()
+        run: |
+          rm -rf private_keys
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/Streamr_AppStore.mobileprovision"
+          if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN" || true; fi
