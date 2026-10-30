@@ -1,0 +1,21 @@
+# Xcode / Swift
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+.swiftpm/
+
+# XcodeGen regenerates the .xcodeproj from project.yml — don't commit the generated project.
+Streamr.xcodeproj/
+
+# Secrets
+*.mobileprovision
+*.p12
+*.p8
+Config/Secrets.xcconfig

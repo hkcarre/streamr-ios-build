@@ -1,0 +1,43 @@
+// There is no separate dev/staging server — per the backend developer (Gaurav), the
+// entire production system (React + Node/Express + DB) runs on one EC2 instance,
+// and the mobile app is meant to call it directly, same as the website does. Local
+// dev safety comes from the app's own DEBUG demo-mode ("Continue with Demo Data"
+// button + automatic mock fallback), not from a separate backend environment.
+API_BASE_URL = https:/$()/api.streamr.nyc/v1
+API_ENVIRONMENT_NAME = Development
+
+// OAuth credentials. Same values across all three configs — one backend, one
+// registered OAuth app per provider, same as API_BASE_URL.
+//
+// Facebook App ID is CONFIRMED REAL (found 2026-08-31, baked into the live
+// website's public JS bundle at streamr.nyc/assets/login-*.js — App IDs are
+// meant to be public-facing, not secret, so pulling it from the deployed
+// bundle is legitimate, not a leak). Per the engineering handoff, this App ID
+// is "typically reusable across platforms" — still needs an iOS platform
+// entry added in Facebook Developer Console (app → Settings → Basic →
+// Add Platform → iOS, bundle id nyc.streamr.streamr) before login will work.
+FACEBOOK_APP_ID = 25500805429596280
+
+// Client Token is NOT discoverable the same way — the web app's login flow
+// (JS SDK OAuth redirect) never needs it client-side; iOS's native SDK does.
+// Get it from Facebook Developer Console → Settings → Advanced → Client Token.
+FACEBOOK_CLIENT_TOKEN = REPLACE_ME_FACEBOOK_CLIENT_TOKEN
+FACEBOOK_DISPLAY_NAME = Streamr
+
+// Google: the web app's own client ID (also found in the public bundle) is
+// 778329962048-mjs06muvq8c2o7e86n82pisb3djbs5ms.apps.googleusercontent.com —
+// confirms the Google Cloud project number is 778329962048. Google requires a
+// SEPARATE client ID per platform though, so the web one can't just be reused
+// here: create a new "iOS" OAuth client under that same project (Google Cloud
+// Console → APIs & Services → Credentials), bundle id nyc.streamr.streamr.
+GOOGLE_CLIENT_ID = REPLACE_ME_GOOGLE_IOS_CLIENT_ID.apps.googleusercontent.com
+GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.REPLACE_ME
+
+// Local-only real credential overrides — this file is gitignored (see
+// Config/Secrets.xcconfig.example for what to put in it), so real values
+// never touch git history. Placed last: xcconfig resolves a repeated key to
+// whichever assignment it saw last, so this silently overrides the
+// REPLACE_ME defaults above when the file exists, and is a harmless no-op
+// (via the `?`) everywhere it doesn't — including CI, which has no local
+// secrets and keeps building against the placeholders exactly as before.
+#include? "Secrets.xcconfig"

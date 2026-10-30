@@ -1,0 +1,17 @@
+// Same single production backend — see Debug.xcconfig. No separate staging server
+// exists (confirmed via AWS account audit + the backend developer's own account of
+// the setup: one EC2 instance, "stream-prod", serves everything).
+API_BASE_URL = https:/$()/api.streamr.nyc/v1
+API_ENVIRONMENT_NAME = Staging
+
+// OAuth credentials — see Debug.xcconfig for the full explanation of what's
+// confirmed real vs. still a placeholder, and where each value comes from.
+FACEBOOK_APP_ID = 25500805429596280
+FACEBOOK_CLIENT_TOKEN = REPLACE_ME_FACEBOOK_CLIENT_TOKEN
+FACEBOOK_DISPLAY_NAME = Streamr
+GOOGLE_CLIENT_ID = REPLACE_ME_GOOGLE_IOS_CLIENT_ID.apps.googleusercontent.com
+GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.REPLACE_ME
+
+// See Debug.xcconfig's matching comment — local-only override, gitignored,
+// no-op when absent (CI).
+#include? "Secrets.xcconfig"

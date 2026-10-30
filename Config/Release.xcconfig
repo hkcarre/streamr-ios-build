@@ -1,0 +1,19 @@
+// Confirmed live and reachable 2026-08-08: GET https://api.streamr.nyc/v1/stream/public/list
+// returns real data matching this app's APIResponse<T> contract. CORS is wide open
+// (Access-Control-Allow-Origin: *), so the mobile app is treated as just another client.
+API_BASE_URL = https:/$()/api.streamr.nyc/v1
+API_ENVIRONMENT_NAME = Production
+
+// OAuth credentials — see Debug.xcconfig for the full explanation of what's
+// confirmed real vs. still a placeholder, and where each value comes from.
+// GOOGLE_CLIENT_ID / GOOGLE_REVERSED_CLIENT_ID / FACEBOOK_CLIENT_TOKEN still
+// MUST be replaced with real values before a Release build is submitted.
+FACEBOOK_APP_ID = 25500805429596280
+FACEBOOK_CLIENT_TOKEN = REPLACE_ME_FACEBOOK_CLIENT_TOKEN
+FACEBOOK_DISPLAY_NAME = Streamr
+GOOGLE_CLIENT_ID = REPLACE_ME_GOOGLE_IOS_CLIENT_ID.apps.googleusercontent.com
+GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.REPLACE_ME
+
+// See Debug.xcconfig's matching comment — local-only override, gitignored,
+// no-op when absent (CI).
+#include? "Secrets.xcconfig"
